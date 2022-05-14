@@ -1,0 +1,418 @@
+---
+title: "DSA2101 Group Project"
+output:
+  output: html_document
+  df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+library(tidytuesdayR)
+library(tidyverse)
+library(tibble)
+library(janitor)
+library(stringr)
+library(lubridate)
+library(viridis)
+library(raster)
+library(ggnewscale)
+library(ggrepel)
+library(rnaturalearth)
+```
+
+## Factors influencing Caribou Movements
+
+By Group D
+
+Name and matriculation number of team members:
+
+Name | Matriculation number
+---- | ----
+Aaron Lee Wei Qi | A0216341R
+Liu Ernest Hin Yui | A0216284E
+Lee Zheng Yao Daniel | A0223259E
+Leon Tan | A0216096A
+Poh Yu Jie | A0216055M
+
+## Introduction
+
+Our project explores the "Caribou Location Tracking" data package. We chose to work on this data package as we were keen to experiment with geographical data in our analysis. Furthermore, as a group of nature and animal enthusiasts, we were naturally interested to find out more about the movement of this vulnerable species, and learn how its conservation could be better facilitated with data-driven decisions.\
+Our project will cover two questions:\
+1. "Does temperature influence the migration habits of caribous?"\
+2. "Do predators have an effect on the movement patterns of caribous?"\
+
+These questions allow us to better understand the habits and lives of caribous, and explore relationships between different variables to identify the causes of this species' vulnerability.
+
+
+## Data Description
+
+The data package details the movement of 260 woodland caribou in northern British Columbia, Canada, from the period of 1988 to 2016. It was accessed through Movebank, a free service that aids researchers in consolidating, distributing, examining, and recording animal movement data. It was prepared for a 2014 study by the British Columbia Ministry of Environment & Climate Change to provide insights into the management and recovery of this species, which is categorised as a "Vulnerable" species by the International Union for the Conservation of Nature (IUCN) Red List.
+
+```{r Data Description 1}
+individuals = readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-06-23/individuals.csv')
+locations = readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-06-23/locations.csv')
+
+#Clean individuals
+individuals$sex <- as.factor(individuals$sex)
+individuals$life_stage <- as.factor(individuals$life_stage)
+individuals$study_site <- as.factor(individuals$study_site)
+
+#Clean locations
+coords_convert = function(lat1, lon1, lat2, lon2) {
+  earth_radius = 6378.137
+  dLat = lat2 * pi / 180 - lat1 * pi / 180
+  dLon = lon2 * pi / 180 - lon1 * pi / 180
+  a = sin(dLat/2) * sin(dLat/2) + cos(lat1 * pi / 180) * cos(lat2 * pi / 180) * sin(dLon/2) * sin(dLon/2)
+  c = 2 * atan2(sqrt(a), sqrt(1-a))
+  d = earth_radius * c
+  return(d * 1000)
+}
+
+#locations$season <- as.factor(locations$season)
+#locations$study_site <- as.factor(locations$study_site)
+locations = locations %>%
+  mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+         habitat = substr(animal_id, 1, 2)) %>% # "GR" "BP" "HR" "KE" "MO" "NA" "QU" "SC"
+  mutate(year = year(timestamp),
+         month = month(timestamp),
+         day = month(timestamp))
+
+```
+
+The data package consists of two .csv files, which will be stored in the variables `individuals` and `locations`. We transform both files by converting some variables into factors, such as `sex`, `life_stage`, and `study_site` in `individuals`, as well as `season` and `study_site` in `locations`. Additionally, the date was extracted from the `timestamp` variable, and a `distance` variable was added based on the `longitude` and `latitude` variables.
+
+```{r Data Description 2}
+#Individuals
+dim(individuals)
+individuals_clean = distinct(individuals)
+dim(individuals_clean)
+dim(distinct(individuals_clean, animal_id, .keep_all = TRUE))
+individuals_clean %>%
+  group_by(animal_id) %>%
+  filter(n()>1) %>%
+  arrange(animal_id, .by_group = TRUE) %>%
+  summarise(animal_id, deploy_on_comments, deploy_off_comments)
+
+individuals_clean %>%
+  distinct(animal_id, .keep_all = TRUE) %>%
+  group_by(sex) %>%
+  summarise(gendersplit = n()/260)
+```
+We note that the `individuals` dataset contains 286 observations, and even after removing duplicated rows there are still 277 observations. However, further inspection reveals that there are indeed only 260 unique animals in the dataset as earlier described. Animals with more than one observation had faulty GPS trackers and had to be re-tagged with new ones.
+
+We also note that amongst the 260 caribous, 98.5% are female while only 1.5% are male. This is likely due to the slightly shorter lifespan of a male caribou, but can also be explained by the fact that most caribou herds only have one male for every 20 females, hence accounting for the extremely low percentage of males. 
+
+```{r Data Description 3}
+#Locations
+dim(locations)
+observations_per_study_site = locations %>%
+  count(study_site)
+observations_per_study_site %>%
+  arrange(desc(n))
+
+caribous_per_study_site = individuals_clean %>%
+  distinct(animal_id, .keep_all=TRUE) %>%
+  count(study_site)
+caribous_per_study_site %>%
+  arrange(desc(n))
+
+study_site = c(observations_per_study_site$study_site)
+mean_observations_per_caribou = c(observations_per_study_site$n/caribous_per_study_site$n)
+data.frame(study_site, mean_observations_per_caribou) %>%
+  arrange(desc(mean_observations_per_caribou)) %>%
+  head(n=10)
+
+```
+
+We note that 249450 unique observations are present in the `locations` file, with the largest number of observations from the Quintette area. Expectedly, the Quintette site also has the highest number of caribous. Interestingly however, when compared to the number of observations per caribou, we note that caribous from the Scott study site have the highest mean observations per caribou, averaging 2050 mean observations per caribou. 
+
+## Question 1: "Does temperature influence the migration habits of caribous?"
+
+### Introduction
+
+Our first question will explore the migration patterns of caribous in relation to temperature. We will first look at how caribous migrate across their lifespan. We will use the `locations` dataset, but we will be restricting the time period to 2000-2016, a period of 17 years, which is also the lifespan of a woodland caribou. Additionally, we will also use topological data for the northern British Columbia region (Source 2). By understanding where and how caribous move from year to year, we can gain more insights about the driving factors for caribou migration, and thus improve the conservation efforts for the species.
+
+### Methodology
+
+We will first present a map of the average yearly location of the caribous, grouped by study site. As the map contains three variables, `longitude`, `latitude`, and `temperature`, we use `geom_raster()` to plot the geographical location of northern British Columbia. For the average yearly location of the caribous, we first group the `locations` dataset by `year` and `study_site`, then take the mean `longitude` value and the mean `latitude` value to represent the average yearly location of the caribous in each study site. As these points will be overlaid onto the map with x- and y-axes of `longitude` and `latitude` respectively, we use `geom_path()` as we wish to track the geographical movements of the caribous from year to year.
+
+The second visualisation tracks the distance travelled by the caribous every winter and summer. Since distance travelled and time are both continuous variables, we decide to use `geom_line()` to plot this graph as it will allow us to clearly identify patterns or recognise deviations in the data.
+
+### Visualisation 1
+
+```{r qn1_p1, warning = FALSE}
+locations = locations %>%
+  group_by(animal_id) %>%
+  arrange(animal_id, timestamp) %>%
+  mutate(distance = coords_convert(latitude,longitude,lag(latitude),lag(longitude)),
+         time_lag = timestamp - lag(timestamp))
+
+caribou = locations %>% arrange(timestamp)
+caribou_clustering = caribou %>%
+  filter(year > 2000) %>%
+  group_by(habitat, year, season) %>%
+  summarise(ave_long = mean(longitude),
+            ave_lat = mean(latitude),
+            num_animals = length(unique(animal_id)),
+            dist_travelled = sum(distance, na.rm = T))
+
+#Map plot
+habitat_labels = c("HR" = "#FFCDD2", 
+                   "GR" = "#E1BEE7", 
+                   "KE" = "#90CAf9",
+                   "MO" = "#006064",
+                   "QU" = "#81C784",
+                   "BP" = "#FFF176",
+                   "NA" = "#F8BBD0",
+                   "SC" = "#FFAB91")
+
+raster_topo = getData("worldclim", var = 'alt', res= 0.5,lon = -123.4, lat = 55.85)
+raster_canada_topo = crop(raster_topo, extent(-123.5,-120, 54, 57))
+raster_canada_topo_df = as.data.frame(raster_canada_topo, xy = TRUE)
+
+ggplot() + 
+  geom_raster(data = raster_canada_topo_df, aes(x = x, y = y, fill = alt_11)) +
+  scale_fill_gradientn(name = 'altitude(m)', colours = c("black","white")) +
+  
+  geom_path(data = caribou_clustering %>% filter(habitat == "HR"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#B71C1C","#FFCDD2")) + # RED
+  
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "GR"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#4A148C","#E1BEE7")) + # PURPLE
+
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "KE"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#0D47A1","#90CAf9")) + # BLUE
+
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "MO"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#006064","#00838F")) + # CYAN
+  
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "QU"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#2E7D32","#81C784")) + # GREEN
+  
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "BP"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#FBC02D","#FFF176")) + # YELLOW
+  
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "NA"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#880E4F","#F8BBD0")) + # PINK
+  
+  new_scale_color() +
+  geom_path(data = caribou_clustering %>% filter(habitat == "SC"), 
+            aes(x = ave_long, y = ave_lat,  group = habitat, color = year), 
+            show.legend = FALSE, 
+            alpha = 1,
+            size = 2) +
+  scale_color_gradientn(colours = c("#FF5722","#FFAB91")) + # ORANGE
+
+  new_scale_color() +
+  geom_point(aes(x = -123,y = 54.2, colour = "HR"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "GR"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "KE"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "MO"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "QU"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "BP"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "NA"),size = 2, alpha = 1) +
+  geom_point(aes(x = -123,y = 54.2, colour = "SC"),size = 2, alpha = 1) +
+  scale_colour_manual(name = "Habitats",
+                      breaks = c("HR", "GR", "KE","MO","QU","BP","NA" ,"SC"),
+                      values = habitat_labels) +
+  
+  new_scale_color() +
+  geom_point(aes(x = -123,y = 54.2, col = "gray"),size = 2, alpha = 1, show.legend = FALSE) +
+  scale_colour_manual(values = c("gray" = "#292929")) +
+  
+  labs(x = 'Longitude', y = 'Latitude',
+       title = 'Caribou Herds Migration from 2000 to 2016',
+       subtitle = 'Lighter colour gradient denotes recent years')
+```
+
+### Discussion 1
+
+From the map, we notice that caribous gravitate towards areas with higher altitudes, as seen from the congregation of coloured paths at the lighter locations on the map. This is consistent across the various study sites. We also note that the caribous also tend to move northwards over time, presumably in search for cooler temperatures. This corroborates with the earlier observation, since higher altitudes have cooler temperatures. This trend in their migration pattern is likely due to their thick coat that helps them retain body heat and survive in cooler environments. 
+
+### Visualisation 2
+
+```{r qn1_p2}
+# caribou average location each seasonal year AFTER the year 2000
+
+# Line graph
+text_df = caribou_clustering %>%
+  group_by(habitat, season) %>%
+  summarise(max_year = max(year))
+
+
+caribou_overall_stats = caribou_clustering %>% 
+  group_by(year, habitat, season) %>%
+  summarise(total_dist_travelled = sum(dist_travelled),
+            num_animals = sum(num_animals))
+
+text_df2 = caribou_overall_stats %>%
+  inner_join(text_df, by = c('habitat' = 'habitat', 'year' = 'max_year', 'season' = 'season'))
+
+ggplot(data = caribou_overall_stats, aes(x = year, y = total_dist_travelled/(num_animals*100000))) +
+  facet_wrap(habitat ~ ., ncol = 2) +
+  geom_line(aes(color = season), size = 2, alpha = 0.5) +
+  geom_point(aes(color = season)) +
+  labs(x = 'Year', y = 'Average Distance Travelled per Caribou (in 100km)',
+       title = 'Caribou Herds Migration Over the Years',
+       subtitle = 'From 2000 to 2016')
+```
+
+### Discussion 2
+ 
+From the 2nd visualisation, we note that caribous generally move more during summer than during winter. This supports our findings from the earlier visualisation that caribous are more comfortable in cooler environments, hence they move less during the winters. Interestingly, caribous in Quintette, Moberly, and Narraway displayed a peak in their distance travelled in 2010. This could be due to some temporary human activities in the area that drove caribous away, such as forest harvesting which were later halted due to pressures from environmental groups (Source 2).
+ 
+## Question 2: "Do predators have an effect on the movement patterns of caribous?"
+
+### Introduction
+
+The second question we will be looking at is **"Do predators have an effect on the movement patterns of caribous?"**. To answer this question, we intend to analyse the `individuals` dataset to identify locations where caribous often fall prey to predators, as well as the `locations` dataset to see the average movement of the Caribous. If we can understand how predators affect caribous, we can better protect them from their natural predators, hence, preserving and hopefully increasing their low populations. 
+
+### Methodology
+
+In the `individuals` dataset, since most of our data given are categorical in nature, we use a scatter plot to draw the points. Specifically, `geom_count()` will be used. Since we are showing the distribution based on discrete values, we believe that `geom_count()` will highlight the distribution of deaths clearly based on discrete values. The predators are on the y-axis, plotted against location on the x-axis, with the colour of the points differentiated by `life_stage` to see the age of commonly preyed on groups. As for the second graph, since both speed and time are continuous values, we will be using a line plot, specifically, `geom_line()` as it would allow us to see the trends and changes in movement speeds clearly over the time period. The x-axis will be the average speed of the caribous in Kilometers/Hr against the months.
+
+### Visualisation 1
+
+```{r qn2_set_up}
+total = merge(locations,individuals, by = "animal_id")
+```
+
+```{r qn2_p1}
+#those with a death cause
+dead <- individuals %>% drop_na(death_cause)
+
+# group causes of death into Accident, in field, predation, or unknown
+cat <- function(x) {
+  if(grepl( "Accidental", x, fixed = TRUE)) {
+    return("Accidental")
+  }
+  else if(grepl( "Collar Still in Field", x, fixed = TRUE)) {
+    return("Collar still in Field")
+  }
+  else if(grepl( "Collar still in Field", x, fixed = TRUE)) {
+    return("Collar still in Field")
+  }
+  else if(grepl( "Predation", x, fixed = TRUE)) {
+    return("Predation")
+  }
+  else if(grepl( "collision", x, fixed = TRUE)) {
+    return("Accidental")
+  }
+  else if(grepl( "Collision", x, fixed = TRUE)) {
+    return("Accidental")
+  }
+  else if(grepl( "Unknown", x, fixed = TRUE)) {
+    return("Unknown")
+  }
+  else{
+    return("error404")
+  }
+}
+dead$Cat <- sapply(dead$death_cause, cat)
+# we then inspect predation
+pred <- dead %>% filter(Cat == "Predation") %>%
+  mutate(death_cause = str_sub(death_cause, 13, nchar(death_cause))) %>%
+  mutate(death_cause = recode(death_cause,
+                              "Grizzly" = "Grizzly Bear"))
+
+#find longitude and latitude of predations
+pred_want <- pred %>% dplyr::select(study_site, death_cause, life_stage)
+
+ggplot(pred_want, aes(study_site, death_cause, color = life_stage)) +
+  geom_count(position = "jitter")  +
+  labs(title="Predation by region",
+                      x ="Study Site", y = "Death Cause")
+```
+
+### Discussion 1
+
+From the data, we learn that most of the recognisable predator marks are from wolfs and Grizzly Bears, the natural predators of caribous (Sources 2, 3, 4). Notice that of the recognisable age groups, those of age 3 to 6 are the most often killed by these predators, which coincide with the age which they reach sexual maturity at 3. This is concerning as losing caribous capable of reproduction would reduce the number of offspring and reduce the overall sustainability of the population. Furthermore, amongst older caribous, namely those from 8 to 12 years of age, are less likely to fall prey as there is a lower chance that they will be able to survive to such an old age. As mentioned in Question1, woodland caribous are capable of living up to 17 years old. Hence, with such a large number falling prey at such a young age, more can to be done to protect younger caribous to hopefully increase their numbers.  
+
+### Visualisation 2
+
+```{r qn2_p2}
+
+
+locations2 = locations %>%
+  group_by(animal_id) %>%
+  mutate(last_longitude = lag(longitude),
+  last_latitude = lag(latitude),
+  hours = as.numeric(difftime(timestamp, lag(timestamp), unit = "hours")),
+  dist = coords_convert(latitude,longitude,last_latitude,last_longitude),
+                speed = dist / hours)
+
+
+
+locations2 %>%
+  filter(hours <= 8,
+         hours >= 0.5) %>%
+  group_by(month = month(timestamp, label = TRUE),
+           study_site) %>%
+  summarise(avg_speed = mean(speed),
+            n=n()) %>%
+  ggplot(aes(month, avg_speed, group = study_site,
+             color = study_site)) +
+  geom_line() +
+  geom_point(aes(size = n)) +
+  labs( title = "Monthly caribou average speed",
+        x = "Month", y = "Average Speed (Km/h)") +
+  facet_wrap(~ study_site, nrow = 2) +
+  theme(legend.position = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+ 
+```
+
+### Discussion 2
+
+Comparing these graphs against the previous data, we notice that groups, such as those in Moberly, have an overall lower speed as compared to areas such as Kennedy. This could be attributed to the low numbers of predatory related deaths in the region, hence caribous in that region would not have to run away from predators, resulting in overall lower speed. Moreover, there is a gradual decrease in caribou average speed from November to March across all the study sites. This coincides with the Grizzly Bear's hibernation period (Source 5), which supports our claim that predators do indeed have an effect on the movements of the caribous. The caribous also tend to follow a rather standard peak in average movement speed in August, with some exceptions such as Hart Ranges and Narraway, which could be due to migration route differences. 
+
+
+## Reference
+
+List any references in this section. At a minimum, you should list your data source.
+
+1. Data Source: Our data source is from The TidyTuesday Project. Link to the dataset: <<https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-06-23/readme.md>> 
+
+2. Human activities in caribou territories: <<https://www2.gov.bc.ca/assets/gov/environment/plants-animals-and-ecosystems/wildlife-wildlife-habitat/caribou/science_update_final_from_web_jan_2014.pdf>>
+
+3. Website for predators: <<https://a-z-animals.com/animals/caribou/#:~:text=Grizzly%20bears%20and%20wolves%20are%20the%20primary%20predators%20of%20caribou.>>
+
+4. Grizzly Bear diet: <<https://www.nwf.org/Educational-Resources/Wildlife-Guide/Mammals/Grizzly-Bear#:~:text=Grizzly%20bears%20are%20omnivores.,elk%2C%20caribou%2C%20and%20deer.>>
+
+5. Wolf diet: <<https://www.nwf.org/Educational-Resources/Wildlife-Guide/Mammals/Gray-Wolf#:~:text=Wolves%20are%20carnivores%E2%80%94they%20prefer,meat%20in%20a%20single%20meal.&text=Wolves%20communicate%20through%20body%20language,barking%2C%20growling%2C%20and%20howling.>>
+
+6. Website on Grizzly Bear hibernation: <<https://www.yellowstonepark.com/things-to-do/wildlife/yellowstone-bear-hibernation/>>
